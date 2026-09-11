@@ -5,6 +5,9 @@ on:
     # Monday / Thursday 09:30 Asia/Shanghai.
     - cron: '30 1 * * 1,4'
   workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/changdu-batch-research.yml'
 
 permissions:
   contents: read
