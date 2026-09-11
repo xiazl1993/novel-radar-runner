@@ -1,0 +1,114 @@
+name: collection-split-validation
+
+on:
+  push:
+    paths:
+      - '.github/workflows/collection-split-validation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: novel-radar-collection-split-validation
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout private Novel Radar core
+        uses: actions/checkout@v4
+        with:
+          repository: xiazl1993/novel-radar
+          ref: main
+          token: ${{ secrets.NOVEL_RADAR_CORE_TOKEN }}
+          path: core
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: core/pyproject.toml
+
+      - name: Install private core
+        run: pip install -e ./core
+
+      - name: Collect curated short stories
+        working-directory: core
+        env:
+          NOVEL_RADAR_DATABASE_URL: ${{ secrets.NOVEL_RADAR_DATABASE_URL }}
+        run: python scripts/run_public_runner_task.py changdu
+
+      - name: Validate text splitting
+        working-directory: core
+        env:
+          NOVEL_RADAR_DATABASE_URL: ${{ secrets.NOVEL_RADAR_DATABASE_URL }}
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          from novel_radar.db import NovelText, SessionLocal
+          from novel_radar.services.text_splitter import normalize_story_text, split_short_story
+
+          summary = json.loads(Path('artifacts/changdu-batch-summary.json').read_text(encoding='utf-8'))
+          chapters = [
+              chapter
+              for item in summary['items']
+              if not item.get('error')
+              for chapter in (item.get('chapters') or [])
+          ]
+
+          assert summary['count'] > 0, 'no stories collected'
+          assert summary['failed'] == 0, 'collection failures present'
+          assert chapters, 'no collected chapters available for split validation'
+
+          total_slices = 0
+          empty_slice_count = 0
+          reconstruction_failures = 0
+          count_mismatches = 0
+          oversized_slices = 0
+          min_slices = None
+          max_slices = 0
+
+          with SessionLocal() as session:
+              for chapter in chapters:
+                  text = session.get(NovelText, chapter['text_id'])
+                  assert text is not None, 'persisted text missing'
+                  slices = split_short_story(text.text)
+                  slice_count = len(slices)
+                  total_slices += slice_count
+                  min_slices = slice_count if min_slices is None else min(min_slices, slice_count)
+                  max_slices = max(max_slices, slice_count)
+                  empty_slice_count += sum(1 for item in slices if not item.text.strip())
+                  oversized_slices += sum(1 for item in slices if len(item.text) > 2400)
+                  if slice_count != chapter['slice_count']:
+                      count_mismatches += 1
+                  reconstructed = '\n'.join(item.text for item in slices)
+                  if reconstructed != normalize_story_text(text.text):
+                      reconstruction_failures += 1
+
+          assert min_slices and min_slices > 0, 'one or more chapters produced zero slices'
+          assert empty_slice_count == 0, 'empty slices detected'
+          assert count_mismatches == 0, 'split count mismatch detected'
+          assert reconstruction_failures == 0, 'split reconstruction mismatch detected'
+
+          avg_slices = round(total_slices / len(chapters), 2)
+          print(json.dumps({
+              'stories': summary['count'],
+              'collection_failed': summary['failed'],
+              'chapters_validated': len(chapters),
+              'total_slices': total_slices,
+              'min_slices_per_chapter': min_slices,
+              'max_slices_per_chapter': max_slices,
+              'avg_slices_per_chapter': avg_slices,
+              'empty_slices': empty_slice_count,
+              'count_mismatches': count_mismatches,
+              'reconstruction_failures': reconstruction_failures,
+              'oversized_slices_over_2400': oversized_slices,
+          }, ensure_ascii=False))
+          PY
